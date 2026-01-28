@@ -10,6 +10,7 @@ The QINIZX 2-key keyboard is a compact USB HID device commonly sold on Amazon. I
 - Vendor ID: `0x8808`
 - Product ID: `0x6601`
 - Also sold under brand names: KOOLERTRON, Vortex, and generic "2-key keyboard"
+- [Buy on Amazon](https://www.amazon.com/USB-Micro-Interface-One-Handed-Mechanical-Programming/dp/B09NX4NXX8/)
 
 ## Features
 
