@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
-QINIZX 2-Key Keyboard Programmer
+QINIZX Programmable Keyboard Programmer (macOS)
+
+Supports:
+- 2-Key keyboard (Product ID: 0x6601)
+- 4-Key keyboard (Product ID: 0x6604)
 
 Protocol discovered from reverse engineering Windows software (Run-me.exe):
-- Read command: 0x55 (returns 6 config slots)
+- Read command: 0x55 (returns config slots)
 - Write command: [key_index] + key data bytes
 - Key data format depends on mode:
   - Mode 0x01 = combo key (modifier + key)
   - Mode 0x02 = mouse
   - Mode 0x03 = media key
   - Mode 0x04 = string/macro (multiple keycodes typed in sequence)
-- Data length for "2K" keyboard = 0x35 (53) bytes
+- Data length: 0x35 (53) bytes
 """
 
 import ctypes
@@ -35,7 +39,6 @@ KEY_CODES = {
 }
 
 # Extended keycodes for shifted characters (discovered from Windows app IL code)
-# The IL stores hex strings: "96" = 0x96, "AB" = 0xAB, etc.
 SHIFTED_KEYCODES = {
     '!': 0x96,
     '@': 0x97,
@@ -68,6 +71,14 @@ MODE_COMBO = 0x01     # Single key with modifier
 MODE_MOUSE = 0x02     # Mouse action
 MODE_MEDIA = 0x03     # Media key
 MODE_STRING = 0x04    # String/macro mode (sequence of keys)
+
+# Supported keyboards
+# Data lengths discovered from Windows .NET driver (KeyIDToDataLen function)
+KEYBOARDS = {
+    0x6601: {'name': '2-Key', 'keys': 2, 'slots': 6, 'data_len': 0x35},   # 53 bytes
+    0x6604: {'name': '4-Key', 'keys': 4, 'slots': 12, 'data_len': 0x15},  # 21 bytes - firmware drops last char, so +1
+}
+VENDOR_ID = 0x8808
 
 # Load hidapi
 for path in ['/opt/homebrew/lib/libhidapi.dylib', '/usr/local/lib/libhidapi.dylib']:
@@ -109,34 +120,45 @@ hid_device_info._fields_ = [
     ('next', ctypes.POINTER(hid_device_info)),
 ]
 
-VENDOR_ID = 0x8808
-PRODUCT_ID = 0x6601
-DATA_LEN = 0x35  # 53 bytes for 2K keyboard
-
 
 def find_device():
-    """Find the vendor interface of the keyboard."""
+    """Find the vendor interface of any supported keyboard."""
     dev_info = ctypes.cast(
-        hidapi.hid_enumerate(VENDOR_ID, PRODUCT_ID),
+        hidapi.hid_enumerate(VENDOR_ID, 0),  # Enumerate all products from vendor
         ctypes.POINTER(hid_device_info)
     )
 
     vendor_path = None
+    product_id = None
+    fallback_path = None
+    fallback_product_id = None
+
     current = dev_info
     while current:
         info = current.contents
-        if info.usage_page == 0xFF00:
-            vendor_path = info.path.decode()
-            break
+        if info.product_id in KEYBOARDS:
+            # Prefer 0xFF00 (primary vendor interface)
+            if info.usage_page == 0xFF00:
+                vendor_path = info.path.decode()
+                product_id = info.product_id
+                break
+            # Fallback to 0xFFA0 if no 0xFF00 found
+            elif info.usage_page == 0xFFA0 and not fallback_path:
+                fallback_path = info.path.decode()
+                fallback_product_id = info.product_id
         if info.next:
             current = info.next
         else:
             break
 
-    return vendor_path
+    if not vendor_path and fallback_path:
+        vendor_path = fallback_path
+        product_id = fallback_product_id
+
+    return vendor_path, product_id
 
 
-def read_config(handle):
+def read_config(handle, num_slots=6):
     """Read current keyboard configuration."""
     buf = ctypes.create_string_buffer(64)
 
@@ -145,9 +167,9 @@ def read_config(handle):
     cbuf = ctypes.create_string_buffer(cmd)
     hidapi.hid_write(handle, cbuf, 64)
 
-    # Read responses (6 config slots)
+    # Read responses
     configs = []
-    for _ in range(6):
+    for _ in range(num_slots):
         result = hidapi.hid_read_timeout(handle, buf, 64, 200)
         if result > 0:
             configs.append(bytes(buf.raw[:result]))
@@ -155,7 +177,7 @@ def read_config(handle):
     return configs
 
 
-def hid_send(handle, data):
+def hid_send(handle, data, data_len):
     """
     Send data to keyboard using the Windows app protocol.
 
@@ -166,13 +188,13 @@ def hid_send(handle, data):
     4. Create HidReport with this data
     5. WriteReport with 500ms timeout
 
-    The data should be exactly DATA_LEN (53) bytes.
+    The data should be exactly data_len bytes.
     Final payload: [length] [data...] padded to 64 bytes.
     """
-    # Ensure data is exactly DATA_LEN bytes
-    if len(data) < DATA_LEN:
-        data = list(data) + [0] * (DATA_LEN - len(data))
-    data = data[:DATA_LEN]
+    # Ensure data is exactly data_len bytes
+    if len(data) < data_len:
+        data = list(data) + [0] * (data_len - len(data))
+    data = data[:data_len]
 
     # Prepend length byte (this is what the Windows app does!)
     payload = bytes([len(data)]) + bytes(data)
@@ -188,22 +210,23 @@ def hid_send(handle, data):
     return result
 
 
-def program_single_key(handle, key_num, keycode, modifier=0):
+def program_single_key(handle, key_num, keycode, data_len, modifier=0):
     """
     Program a key with a single keycode (combo mode).
 
-    key_num: 1 or 2 (physical key number)
+    key_num: 1-4 (physical key number, depends on keyboard model)
     keycode: HID keycode (e.g., 0x04 for 'A')
+    data_len: Data length for this keyboard model
     modifier: Modifier byte (0 for none)
     """
     # Build key data: [key_index, mode, modifier, keycode, ...padding...]
     # Mode 0x01 = combo key
-    key_data = [key_num, MODE_COMBO, modifier, keycode] + [0x00] * (DATA_LEN - 3)
-    key_data = key_data[:DATA_LEN]  # Ensure exactly DATA_LEN bytes after key_index
+    key_data = [key_num, MODE_COMBO, modifier, keycode] + [0x00] * (data_len - 3)
+    key_data = key_data[:data_len]  # Ensure exactly data_len bytes after key_index
 
     print(f"  Data: {bytes(key_data[:10]).hex()}...")
 
-    return hid_send(handle, key_data)
+    return hid_send(handle, key_data, data_len)
 
 
 def char_to_keycode(char):
@@ -232,12 +255,13 @@ def char_to_keycode(char):
     return None
 
 
-def program_string(handle, key_num, text):
+def program_string(handle, key_num, text, data_len):
     """
     Program a key to type a string (macro mode).
 
-    key_num: 1 or 2 (physical key number)
+    key_num: 1-4 (physical key number)
     text: String to type when key is pressed
+    data_len: Data length for this keyboard model
 
     Uses extended keycodes (0x96+ for shifted symbols, 0xAB+ for uppercase).
     """
@@ -254,19 +278,25 @@ def program_string(handle, key_num, text):
         print("Error: No valid keycodes")
         return -1
 
+    # Max keycodes = data_len - 3 (key_num, mode, 0x00 header)
+    max_chars = data_len - 3
+    if len(keycodes) > max_chars:
+        print(f"Warning: String too long! Max {max_chars} chars for this keyboard, truncating.")
+        keycodes = keycodes[:max_chars]
+
     # Format: [key_num, MODE_STRING, 0x00, keycode1, keycode2, ...]
     key_data = [key_num, MODE_STRING, 0x00] + keycodes
 
-    # Pad with 0x00 to reach DATA_LEN total
-    remaining = DATA_LEN - len(key_data)
+    # Pad with 0x00 to reach data_len total
+    remaining = data_len - len(key_data)
     if remaining > 0:
         key_data += [0x00] * remaining
 
-    key_data = key_data[:DATA_LEN]  # Ensure exactly DATA_LEN bytes
+    key_data = key_data[:data_len]  # Ensure exactly data_len bytes
 
     print(f"  Data ({len(key_data)} bytes): {bytes(key_data[:24]).hex()}...")
 
-    return hid_send(handle, key_data)
+    return hid_send(handle, key_data, data_len)
 
 
 def program_key(handle, key_num, keycode, modifier=0):
@@ -275,40 +305,80 @@ def program_key(handle, key_num, keycode, modifier=0):
 
 
 def main():
-    if len(sys.argv) < 3:
+    if len(sys.argv) < 2:
+        print("QINIZX Programmable Keyboard Programmer")
+        print()
         print("Usage: python program_key.py <key_num> <keycode_or_string>")
-        print("  key_num: 1 or 2")
-        print("  keycode: HID keycode in hex (e.g., 04) or key name (e.g., 'a')")
-        print("  string: Text to type (prefix with 'string:' for macro mode)")
+        print("       python program_key.py --detect")
+        print()
+        print("Options:")
+        print("  --detect         Detect connected keyboard")
+        print("  key_num          Key number (1-2 for 2-key, 1-4 for 4-key)")
+        print("  keycode          HID keycode in hex (e.g., 04) or key name (e.g., 'a')")
+        print("  string:TEXT      Program key to type TEXT (macro mode)")
         print()
         print("Examples:")
+        print("  python program_key.py --detect")
         print("  python program_key.py 1 a              # Set key 1 to 'A'")
         print("  python program_key.py 2 enter          # Set key 2 to Enter")
+        print("  python program_key.py 3 f5             # Set key 3 to F5 (4-key only)")
         print("  python program_key.py 1 'string:hello' # Key 1 types 'hello'")
-        print("  python program_key.py 1 'string:rock and roll'")
         print()
         print("Available key names:", ', '.join(sorted(KEY_CODES.keys())))
         return
 
-    key_num = int(sys.argv[1])
-    if key_num not in [1, 2]:
-        print("Error: key_num must be 1 or 2")
-        return
-
-    arg = sys.argv[2]
-
-    # Check if this is a string/macro mode
-    is_string_mode = arg.lower().startswith('string:')
-
     hidapi.hid_init()
 
-    path = find_device()
+    # Detect mode
+    if sys.argv[1] == '--detect':
+        path, product_id = find_device()
+        if path:
+            kb = KEYBOARDS[product_id]
+            print(f"Found: QINIZX {kb['name']} Keyboard")
+            print(f"  Product ID: 0x{product_id:04X}")
+            print(f"  Keys: {kb['keys']}")
+            print(f"  Path: {path}")
+
+            # Read config
+            handle = hidapi.hid_open_path(path.encode())
+            if handle:
+                print(f"\nCurrent configuration ({kb['slots']} slots):")
+                configs = read_config(handle, kb['slots'])
+                for i, cfg in enumerate(configs):
+                    if cfg and any(b != 0 for b in cfg[:8]):
+                        print(f"  Slot {i}: {cfg[:12].hex()}")
+                hidapi.hid_close(handle)
+        else:
+            print("No QINIZX keyboard found!")
+            print("Supported: 2-Key (0x6601), 4-Key (0x6604)")
+        hidapi.hid_exit()
+        return
+
+    # Programming mode
+    if len(sys.argv) < 3:
+        print("Error: Need key_num and keycode. Use --detect to find keyboard.")
+        hidapi.hid_exit()
+        return
+
+    key_num = int(sys.argv[1])
+    arg = sys.argv[2]
+
+    path, product_id = find_device()
     if not path:
         print("Keyboard not found!")
         hidapi.hid_exit()
         return
 
-    print(f"Found keyboard at: {path}")
+    kb = KEYBOARDS[product_id]
+    print(f"Found: QINIZX {kb['name']} Keyboard (0x{product_id:04X})")
+
+    if key_num < 1 or key_num > kb['keys']:
+        print(f"Error: key_num must be 1-{kb['keys']} for {kb['name']} keyboard")
+        hidapi.hid_exit()
+        return
+
+    # Check if this is a string/macro mode
+    is_string_mode = arg.lower().startswith('string:')
 
     handle = hidapi.hid_open_path(path.encode())
     if not handle:
@@ -317,10 +387,10 @@ def main():
         return
 
     # Read current config
-    print("\nCurrent configuration:")
-    configs = read_config(handle)
+    print(f"\nCurrent configuration:")
+    configs = read_config(handle, kb['slots'])
     for i, cfg in enumerate(configs):
-        if cfg:
+        if cfg and any(b != 0 for b in cfg[:8]):
             print(f"  Slot {i}: {cfg[:8].hex()}")
 
     hidapi.hid_close(handle)
@@ -328,16 +398,20 @@ def main():
     # Reopen for write
     handle = hidapi.hid_open_path(path.encode())
 
+    data_len = kb['data_len']
+    max_chars = data_len - 3
+    print(f"  Data length: {data_len} bytes (max {max_chars} chars for strings)")
+
     if is_string_mode:
         # String/macro mode
         text = arg[7:]  # Remove 'string:' prefix
-        print(f"\nProgramming key {key_num} to type: '{text}'")
-        result = program_string(handle, key_num, text)
+        print(f"\nProgramming key {key_num} to type: '{text}' ({len(text)} chars)")
+        result = program_string(handle, key_num, text, data_len)
         print(f"  Write result: {result} bytes")
 
         # Send twice (as Windows app does)
         time.sleep(0.1)
-        result = program_string(handle, key_num, text)
+        result = program_string(handle, key_num, text, data_len)
         print(f"  Write result (2nd): {result} bytes")
     else:
         # Single key mode
@@ -355,12 +429,12 @@ def main():
                 return
 
         print(f"\nProgramming key {key_num} to keycode 0x{keycode:02X}")
-        result = program_single_key(handle, key_num, keycode)
+        result = program_single_key(handle, key_num, keycode, data_len)
         print(f"  Write result: {result} bytes")
 
         # Send twice (as Windows app does)
         time.sleep(0.1)
-        result = program_single_key(handle, key_num, keycode)
+        result = program_single_key(handle, key_num, keycode, data_len)
         print(f"  Write result (2nd): {result} bytes")
 
     hidapi.hid_close(handle)
@@ -369,9 +443,9 @@ def main():
     time.sleep(0.2)
     handle = hidapi.hid_open_path(path.encode())
     print("\nConfiguration after programming:")
-    configs = read_config(handle)
+    configs = read_config(handle, kb['slots'])
     for i, cfg in enumerate(configs):
-        if cfg:
+        if cfg and any(b != 0 for b in cfg[:8]):
             print(f"  Slot {i}: {cfg[:8].hex()}")
 
     hidapi.hid_close(handle)
