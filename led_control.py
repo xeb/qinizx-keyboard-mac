@@ -49,9 +49,11 @@ hid_device_info._fields_ = [
     ('next', ctypes.POINTER(hid_device_info)),
 ]
 
+KEYBOARDS = {
+    0x6601: {'name': '2-Key', 'data_len': 0x35},   # 53 bytes
+    0x6604: {'name': '4-Key', 'data_len': 0x15},   # 21 bytes
+}
 VENDOR_ID = 0x8808
-PRODUCT_ID = 0x6601
-DATA_LEN = 0x35  # 53 bytes
 
 # RGB modes (discovered from IL code - these are index values)
 RGB_MODES = {
@@ -66,33 +68,46 @@ RGB_MODES = {
 
 
 def find_device():
-    """Find the vendor interface of the keyboard."""
+    """Find the vendor interface of any supported keyboard."""
     dev_info = ctypes.cast(
-        hidapi.hid_enumerate(VENDOR_ID, PRODUCT_ID),
+        hidapi.hid_enumerate(VENDOR_ID, 0),
         ctypes.POINTER(hid_device_info)
     )
 
     vendor_path = None
+    product_id = None
+    fallback_path = None
+    fallback_product_id = None
+
     current = dev_info
     while current:
         info = current.contents
-        if info.usage_page == 0xFF00:
-            vendor_path = info.path.decode()
-            break
+        if info.product_id in KEYBOARDS:
+            if info.usage_page == 0xFF00:
+                vendor_path = info.path.decode()
+                product_id = info.product_id
+                break
+            elif info.usage_page == 0xFFA0 and not fallback_path:
+                fallback_path = info.path.decode()
+                fallback_product_id = info.product_id
         if info.next:
             current = info.next
         else:
             break
 
-    return vendor_path
+    if not vendor_path and fallback_path:
+        vendor_path = fallback_path
+        product_id = fallback_product_id
+
+    return vendor_path, product_id
 
 
-def hid_send(handle, data):
+def hid_send(handle, data, data_len=0x35):
     """Send data to keyboard using the Windows app protocol."""
-    # Ensure data is exactly DATA_LEN bytes
-    if len(data) < DATA_LEN:
-        data = list(data) + [0] * (DATA_LEN - len(data))
-    data = data[:DATA_LEN]
+    # Ensure data is exactly data_len bytes
+    if len(data) < data_len:
+        data = list(data) + [0] * (data_len - len(data))
+    data = data[:data_len]
 
     # Prepend length byte
     payload = bytes([len(data)]) + bytes(data)
@@ -105,7 +120,7 @@ def hid_send(handle, data):
     return result
 
 
-def set_rgb_mode(handle, mode_index):
+def set_rgb_mode(handle, mode_index, data_len=0x35):
     """
     Set the RGB lighting mode.
 
@@ -114,15 +129,15 @@ def set_rgb_mode(handle, mode_index):
     data = [0x57, mode_index]
     print(f"  Sending RGB mode command: {bytes(data[:8]).hex()}")
 
-    result = hid_send(handle, data)
+    result = hid_send(handle, data, data_len)
     time.sleep(0.1)
     # Send twice like Windows app does
-    result2 = hid_send(handle, data)
+    result2 = hid_send(handle, data, data_len)
 
     return result > 0 and result2 > 0
 
 
-def set_custom_color(handle, r, g, b):
+def set_custom_color(handle, r, g, b, data_len=0x35):
     """
     Set a custom static color.
 
@@ -131,10 +146,10 @@ def set_custom_color(handle, r, g, b):
     data = [0x70, r, g, b]
     print(f"  Sending color command: {bytes(data[:8]).hex()} (R={r}, G={g}, B={b})")
 
-    result = hid_send(handle, data)
+    result = hid_send(handle, data, data_len)
     time.sleep(0.1)
     # Send twice like Windows app does
-    result2 = hid_send(handle, data)
+    result2 = hid_send(handle, data, data_len)
 
     return result > 0 and result2 > 0
 
@@ -188,7 +203,7 @@ def parse_color(color_str):
 
 def main():
     if len(sys.argv) < 2:
-        print("QINIZX 2-Key Keyboard LED Controller")
+        print("QINIZX Keyboard LED Controller")
         print()
         print("Usage:")
         print("  python led_control.py <mode>           # Set RGB mode")
@@ -213,13 +228,15 @@ def main():
 
     hidapi.hid_init()
 
-    path = find_device()
+    path, product_id = find_device()
     if not path:
         print("Keyboard not found!")
         hidapi.hid_exit()
         return
 
-    print(f"Found keyboard at: {path}")
+    kb = KEYBOARDS[product_id]
+    data_len = kb['data_len']
+    print(f"Found QINIZX {kb['name']} Keyboard (0x{product_id:04X}) at: {path}")
 
     handle = hidapi.hid_open_path(path.encode())
     if not handle:
@@ -248,11 +265,11 @@ def main():
 
         # First set to custom mode, then set color
         print("Setting custom mode...")
-        set_rgb_mode(handle, RGB_MODES.get('custom', 6))
+        set_rgb_mode(handle, RGB_MODES.get('custom', 6), data_len)
         time.sleep(0.1)
 
         print("Setting color...")
-        if set_custom_color(handle, r, g, b):
+        if set_custom_color(handle, r, g, b, data_len):
             print("Color set successfully!")
         else:
             print("Failed to set color")
@@ -261,7 +278,7 @@ def main():
         mode_index = RGB_MODES[arg]
         print(f"\nSetting RGB mode: {arg} (index {mode_index})")
 
-        if set_rgb_mode(handle, mode_index):
+        if set_rgb_mode(handle, mode_index, data_len):
             print("Mode set successfully!")
         else:
             print("Failed to set mode")
@@ -271,7 +288,7 @@ def main():
         try:
             mode_index = int(arg)
             print(f"\nSetting RGB mode index: {mode_index}")
-            if set_rgb_mode(handle, mode_index):
+            if set_rgb_mode(handle, mode_index, data_len):
                 print("Mode set successfully!")
             else:
                 print("Failed to set mode")
